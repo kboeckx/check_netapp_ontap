@@ -1,5 +1,7 @@
 # Nagios plugin to check health of a NetApp Ontap cluster
 
+This is a fork by Filip Sneppe and Kris Boeckx.
+
 ### Idea
 
 This Perl script is able to monitor most components of a NetApp Ontap cluster, such as volume, aggregate, 
