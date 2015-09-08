@@ -1642,7 +1642,7 @@ sub help {
 --critical, -c
         A custom warning threshold value. See the option and threshold list at the bottom of this help text.
 --modifier, -m
-        This modifier is used to set an inclusive or exclusive filter on what you want to monitor.
+        This modifier is used to set an inclusive or exclusive filter on what you want to monitor. Usage: <include|exclude,pattern1,pattern2,etc>
 --ssl, -s
 	Use HTTPS (SSL) to connect to the cluster instead of HTTP.
 --help, -h
