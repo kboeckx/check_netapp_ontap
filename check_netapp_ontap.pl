@@ -1,9 +1,10 @@
 #!/usr/bin/perl
 
 # Script name:		check_netapp_ontap.pl
-# Version:			v2.5.10
+# Version:			v2.5.10b
 # Original author:	Murphy John
 # Current author: 	D'Haese Willem
+# contributer:		Filip Sneppe & Kris Boeckx
 # Purpose: 			Checks NetApp ontapi clusters for various problems, like volume, aggregate, snapshot, 
 #					quota, snapmirror, filer hardware, port, interface, cluster and disk health, but also NetApp alarms
 # On Github:		https://github.com/willemdh/check_netapp_ontap
@@ -14,6 +15,7 @@
 #	10/06/2014 => Added if(defined..) to sub get_volume_space, becasue volumes in transferring mode for a syncing mirror, were causing errors
 #	11/06/2014 => Merged John's 0.6 script with my fork after accepting the transferred project
 #	10/05/2015 => Cleanup script documentation and merged pull request from Waipeng
+#	02/07/2015 => Additional features by Filip Sneppe: diskcount check, diskpath check (MPHA), support for HTTPS
 # Copyright:
 #	This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published
 #	by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program is distributed 
@@ -159,6 +161,220 @@ sub calc_disk_health {
 	if (!(defined($strOutput))) {
                 $strOutput = "OK - No problems found ($intObjectCount checked)";
         }
+
+	return $intState, $strOutput;
+}
+
+##############################################
+## DISKPATH HEALTH
+##############################################
+
+sub get_diskpath_info {
+	my ($nahStorage, $strOwnername) = @_;
+        my $nahDiskIterator = NaElement->new("storage-disk-get-iter");
+	my $nahQuery = NaElement->new("query");
+        my $nahDiskInfo = NaElement->new("storage-disk-info");
+        my $strActiveTag = "";
+        my %hshDiskInfo;
+
+	if (defined($strOwnername)) {
+                $nahDiskIterator->child_add($nahQuery);
+                $nahQuery->child_add($nahDiskInfo);
+        }
+
+        while(defined($strActiveTag)) {
+                if ($strActiveTag ne "") {
+                        $nahDiskIterator->child_add_string("tag", $strActiveTag);
+                }
+
+                $nahDiskIterator->child_add_string("max-records", 600);
+                my $nahResponse = $nahStorage->invoke_elem($nahDiskIterator);
+                validate_ontapi_response($nahResponse, "Failed filer health query: ");
+
+                $strActiveTag = $nahResponse->child_get_string("next-tag");
+
+                if ($nahResponse->child_get_string("num-records") == 0) {
+                        last;
+                }
+
+                foreach my $nahDisk ($nahResponse->child_get("attributes-list")->children_get()) {
+
+			next unless ($nahDisk->child_get("disk-ownership-info")->child_get_string("owner-node-name") eq
+				     $strOwnername);
+
+			my $strDiskName = $nahDisk->child_get_string("disk-name");
+
+			my $paths = $nahDisk->child_get("disk-paths");
+			my @paths = $paths->children_get("disk-path-info");
+
+			$hshDiskInfo{$strDiskName}{'paths'} = $nahDisk->child_get("disk-paths");
+
+			$hshDiskInfo{$strDiskName}{'owner-node-name'} = $nahDisk->child_get("disk-ownership-info")->child_get_string("owner-node-name");
+#			$hshDiskInfo{$strDiskName}{'current-node'} = 
+#				$nahDisk->child_get("disk-ownership-info")->child_get_string("owner-node-name");
+		}
+	}
+
+	return \%hshDiskInfo;
+}
+
+sub calc_diskpath_health {
+	my $hrefDiskInfo = shift;
+        my $intState = 0;
+	my $intObjectCount = 0;
+        my $strOutput = "";
+	my %intNumPaths;
+
+#	my @aryFDRWarning = ("bypassed", "label version", "labeled broken", "LUN resized", "missing", "predict failure", "rawsize shrank", "recovering", "sanitizing", "unassigned");
+#	my @aryFDRCritical = ("bad label", "failed", "init failed", "not responding", "unknown");
+
+	foreach my $strDisk (keys %$hrefDiskInfo) {
+		$intObjectCount = $intObjectCount + 1;
+
+
+		my @paths = $$hrefDiskInfo{$strDisk}{'paths'}->children_get("disk-path-info");
+
+#		print "disk $strDisk:\n";
+
+		$intNumPaths{$strDisk} = 0;
+			
+		foreach my $p (@paths) {
+
+			next unless ($$hrefDiskInfo{$strDisk}{'owner-node-name'} eq 
+				     $p->child_get_int("node"));
+
+			++$intNumPaths{$strDisk};
+
+#			print "       disk port:        ".$p->child_get_string("disk-port")."\n";
+#			print "       disk port name:   ".$p->child_get_string("disk-port-name")."\n";
+#			print "       path link errors: ".$p->child_get_int("path-link-errors")."\n";
+#			print "       path quality:     ".$p->child_get_int("path-quality")."\n";
+#			print "       initiator port:   ".$p->child_get_int("initiator-port")."\n";
+#			print "       node:             ".$p->child_get_int("node")."\n";
+#			print "\n";
+		}
+
+		if ($intNumPaths{$strDisk} != 2) {
+			$strOutput .= " disk ".$strDisk;
+			$intState = 2;
+		}
+
+	}
+
+	if ($intState == 2) {
+		$strOutput = "ERROR:".$strOutput." ($intObjectCount checked)";
+	} elsif ($intState == 0) {
+                $strOutput = "OK - No problems found ($intObjectCount checked)";
+        } else {
+		$strOutput = "UNKNOWN: unknown error ($intObjectCount checked)"
+	}
+
+	return $intState, $strOutput;
+}
+
+##############################################
+## DISKCOUNT HEALTH
+##############################################
+
+sub get_diskcount_info {
+	my ($nahStorage, $strVHost) = @_;
+        my $nahDiskIterator = NaElement->new("storage-disk-get-iter");
+	my $nahQuery = NaElement->new("query");
+        my $nahDiskInfo = NaElement->new("storage-disk-info");
+        my $nahDiskOwnerInfo = NaElement->new("disk-ownership-info");
+        my $strActiveTag = "";
+        my %hshDiskInfo;
+	my $intDiskcount = 0;
+
+	if (defined($strVHost)) {
+                $nahDiskIterator->child_add($nahQuery);
+                $nahQuery->child_add($nahDiskInfo);
+		$nahDiskInfo->child_add($nahDiskOwnerInfo);
+                $nahDiskOwnerInfo->child_add_string("home-node", $strVHost);
+        }
+
+        while(defined($strActiveTag)) {
+                if ($strActiveTag ne "") {
+                        $nahDiskIterator->child_add_string("tag", $strActiveTag);
+                }
+
+                $nahDiskIterator->child_add_string("max-records", 600);
+                my $nahResponse = $nahStorage->invoke_elem($nahDiskIterator);
+                validate_ontapi_response($nahResponse, "Failed filer health query: ");
+
+		$intDiskcount = $nahResponse->child_get_string("num-records");
+
+                $strActiveTag = $nahResponse->child_get_string("next-tag");
+                if ($nahResponse->child_get_string("num-records") == 0) {
+                        last;
+                }
+	}
+
+	return $intDiskcount;
+}
+
+sub calc_diskcount_health {
+	my ($intDiskcount, $strWarning, $strCritical) = @_;
+        my $intState = 0;
+        my $strOutput;
+	my $min_w;
+	my $max_w;
+	my $min_c;
+	my $max_c;
+
+	if (!defined($strWarning)) {
+		$intState  = 3;
+		$strOutput = "UNKNOWN: warning threshold not specified, use -w/--warning";
+		return $intState, $strOutput;
+	}
+	if (!defined($strCritical)) {
+		$intState  = 3;
+		$strOutput = "UNKNOWN: critical threshold not specified, use -c/--critical";
+		return $intState, $strOutput;
+	}
+
+	if ($strWarning =~ m/^([0-9]+)?,([0-9]+)?$/) {
+		$min_w = (defined($1)) ? $1:-1;
+		$max_w = (defined($2)) ? $2:-1;
+	} else {
+		$intState  = 3;
+		$strOutput = "UNKNOWN: warning thresholds not set correctly";
+		return $intState, $strOutput;
+	}
+
+	if ($strCritical =~ m/^([0-9]+)?,([0-9]+)?$/) {
+		$min_c = (defined($1)) ? $1:-1;
+		$max_c = (defined($2)) ? $2:-1;
+	} else {
+		$intState  = 3;
+		$strOutput = "UNKNOWN: critical thresholds not set correctly";
+		return $intState, $strOutput;
+	}
+
+	if (($min_c != -1) && ($min_c > $intDiskcount)) {
+		$strOutput = "CRITICAL: $intDiskcount disk(s), at least $min_c expected";
+		$intState  = 2;
+		return $intState, $strOutput;
+	}
+	if (($max_c != -1) && ($max_c < $intDiskcount)) {
+		$strOutput = "CRITICAL: $intDiskcount disk(s), at most $max_c expected";
+		$intState  = 2;
+		return $intState, $strOutput;
+	}
+	if (($min_w != -1) && ($min_w > $intDiskcount)) {
+		$strOutput = "WARNING: $intDiskcount disk(s), at least $min_w expected";
+		$intState  = 3;
+		return $intState, $strOutput;
+	}
+	if (($max_w != -1) && ($max_w < $intDiskcount)) {
+		$strOutput = "WARNING: $intDiskcount disk(s), at most $max_w expected";
+		$intState  = 3;
+		return $intState, $strOutput;
+	}
+
+	# everything is ok
+	$strOutput = "OK: $intDiskcount disk(s)";
+	$intState  = 0;
 
 	return $intState, $strOutput;
 }
@@ -981,10 +1197,10 @@ sub get_snap_space {
 	my ($nahStorage, $strVHost) = @_;
 	# Set up variables to handle the API queries for snapshot retrieval.
         my $nahVolIterator = NaElement->new("volume-get-iter");
-	my $nahQuery = NaElement->new("query");
+		my $nahQuery = NaElement->new("query");
         my $nahVolInfo = NaElement->new("volume-attributes");
-        my $nahVolIdInfo = NaElement->new("volume-id-attributes");
-        my $nahTag = NaElement->new("tag");
+	    my $nahVolIdInfo = NaElement->new("volume-id-attributes");
+		my $nahTag = NaElement->new("tag");
         my $strActiveTag = "";
         my %hshVolUsage;
 
@@ -997,13 +1213,12 @@ sub get_snap_space {
         }
 
 		# The active tag is a feature of the NetApp API that allows you to do queries in batches. In this case we are getting records in batches of 100.
-        $nahVolIterator->child_add_string("max-records", 100);
+		$nahVolIterator->child_add_string("max-records", 100);
         $nahVolIterator->child_add($nahTag);
         while(defined($strActiveTag)) {
-                if ($strActiveTag ne "") {
-                    $nahTag->set_content($strActiveTag);
+			if ($strActiveTag ne "") {                
+			 $nahTag->set_content($strActiveTag);
                 }
-
 				# Invoke the request.
                 my $nahResponse = $nahStorage->invoke_elem($nahVolIterator);
                 validate_ontapi_response($nahResponse, "Failed volume query: ");
@@ -1023,8 +1238,8 @@ sub get_snap_space {
                         $strVolName = $strVolOwner . "/" . $strVolName;
 
 						# Don't monitor a volume that is currently being moved as it will result in errors.
-                        if (defined($nahVol->child_get("volume-state-attributes")->child_get_string("is-moving")) &&
-                            $nahVol->child_get("volume-state-attributes")->child_get_string("is-moving") eq "true") {
+						if (defined($nahVol->child_get("volume-state-attributes")->child_get_string("is-moving")) &&
+							$nahVol->child_get("volume-state-attributes")->child_get_string("is-moving") eq "true") {
                                 next;
                         }
 
@@ -1055,7 +1270,7 @@ sub get_volume_space {
 	my $nahQuery = NaElement->new("query");
 	my $nahVolInfo = NaElement->new("volume-attributes");
 	my $nahVolIdInfo = NaElement->new("volume-id-attributes");
-    my $nahTag = NaElement->new("tag");
+	my $nahTag = NaElement->new("tag");
 	my $strActiveTag = "";
 	my %hshVolUsage;
 
@@ -1068,12 +1283,12 @@ sub get_volume_space {
 	}
 	
 	# The active tag is a feature of the NetApp API that allows you to do queries in batches. In this case we are getting records in batches of 100.
-    $nahVolIterator->child_add_string("max-records", 100);
-    $nahVolIterator->child_add($nahTag);
+	$nahVolIterator->child_add_string("max-records", 100);
+	$nahVolIterator->child_add($nahTag);
 	while(defined($strActiveTag)) {
-        if ($strActiveTag ne "") {
-            $nahTag->set_content($strActiveTag);
-        }
+		if ($strActiveTag ne "") {
+			$nahTag->set_content($strActiveTag);
+			}
 		
 		$nahVolIterator->child_add_string("max-records", 100);
 		# Invoke the request.
@@ -1165,7 +1380,7 @@ sub calc_space_health {
                         }
                 }
 		
-		# Test to see if the monitored object is on it's home node and raise an alert if it is not.
+		# Test to see if the monitored object is on its home node and raise an alert if it is not.
 		if (defined($hrefSpaceInfo->{$strObj}->{'home-owner'}) && defined($hrefSpaceInfo->{$strObj}->{'current-owner'})) {
 			if ($hrefSpaceInfo->{$strObj}->{'home-owner'} ne $hrefSpaceInfo->{$strObj}->{'current-owner'}) {
 				if ($hrefCritThresholds->{'owner'}) {
@@ -1410,7 +1625,7 @@ sub help {
         my $strVersion = "v0.6 b190514";
         print "\ncheck_netapp_ontapi version: $strVersion\n";
         print "By John Murphy <john.murphy\@roshamboot.org>, GNU GPL License\n";
-        print "\nUsage: ./check_netapp_ontapi.pl -H <hostname> -u <username> -p <password> -o <option> [ -w <warning_thresh> -c <critical_thresh> -m <include|exclude,pattern1,pattern2,etc> ]\n\n";
+        print "\nUsage: ./check_netapp_ontapi.pl -H <hostname> -u <username> -p <password> -o <option> [ -w <warning_thresh> -c <critical_thresh> -m <include|exclude,pattern1,pattern2,etc> ] [ -s ] [ -n node_or_vserver ]\n\n";
         print <<EOL;
 --hostname, -H
         Hostname or address of the cluster administrative interface.
@@ -1428,6 +1643,8 @@ sub help {
         A custom warning threshold value. See the option and threshold list at the bottom of this help text.
 --modifier, -m
         This modifier is used to set an inclusive or exclusive filter on what you want to monitor.
+--ssl, -s
+	Use HTTPS (SSL) to connect to the cluster instead of HTTP.
 --help, -h
         Display this help text.
 
@@ -1487,6 +1704,26 @@ disk_health
         thresh: Not customizable yet.
 	node: The node option restricts this check by cluster-node name.
 
+diskpath_health
+	desc: Check the health of the diskpaths (MPHA) in the cluster
+	thresh: N/A not customizable.
+	node: The node option restricts this check by cluster-node name.
+
+diskcount_health
+	desc: Checks the number of disks present against a set warning and critical theshold.
+	thresh: warning and critical, they are set as follows: 
+	min_threshold,max_threshold for both critical and warning thresholds
+	  * return WARNING if number of disks is lower than warning min_threshold value
+	  * return WARNING if number of disks is higher than warning max_threshold value
+	  * return CRITICAL if number of disks is lower than critical min_threshold value
+	  * return CRITICAL if number of disks is higher than critical max_threshold value
+	  * note: min_threshold *or* max_threshold value can be omitted in the warning and critical 
+	definition, eg.
+	  -c ,20   => there must be a maximum of 20 disks
+	  -c 20,   => there must be a minimum of 20 disks
+	  -c 48,72 => there must be between 48 and 72 disks
+	node: The node option restricts this check by cluster-node name.
+	
 * For keyword thresholds, if you want to ignore alerts for that particular keyword you set it at the same threshold that the alert defaults to.
 
 EOL
@@ -1583,11 +1820,17 @@ sub filter_object {
 	my $strProcType = shift @aryModifier;
 
 	# Perform inclusive or exclusive filtering depending on what the user requested.
+
+#print "proctype:$strProcType\n";
+
 	if ($strProcType eq "exclude") {
 		# Remove every object from the monitoring list that contains the string provided by the user.
 		foreach my $strObject (keys %$hrefObjectsToFilter) { 
+#print "key:$strObject >< $strModifier\n";
 			foreach my $strFilter (@aryModifier) {
+#print " filter:$strFilter\n";
 				if ($strObject =~ m/$strFilter/) {
+#print " => deleting\n";
 					delete($hrefObjectsToFilter->{$strObject});
 				}
 			}
@@ -1623,6 +1866,7 @@ sub filter_object {
 
 # Declare and configure option selections
 my ($strHost, $strVHost, $strUser, $strPassword, $strOption, $strWarning, $strCritical, $strModifier);
+my $strUseSSL = 0;
 
 GetOptions("H=s" => \$strHost,                                  "hostname=s" => \$strHost,
 	   "n=s" => \$strVHost,					"node=s" => \$strVHost,
@@ -1631,22 +1875,23 @@ GetOptions("H=s" => \$strHost,                                  "hostname=s" => 
 	   "o=s" => \$strOption,                                "option=s" => \$strOption,
 	   "w=s" => \$strWarning,            			"warning=s" => \$strWarning,
            "c=s" => \$strCritical,            			"critical=s" => \$strCritical,
+	   "s"   => \$strUseSSL,				"ssl" => \$strUseSSL,
 	   "m=s" => \$strModifier, 				"modifier=s" => \$strModifier);
 
 # Print help if a required field is not entered or if help is requested.
-if (!($strHost || $strUser || $strPassword || $strOption)) {
-	print "A required option is not set!\n";
-        help();
-}
+if ( !(defined $strHost) || ($strHost eq "") )         { print "Hostname is not set!\n"; help(); }; 
+if ( !(defined $strUser) || ($strUser eq "") )         { print "Username is not set!\n"; help();};
+if ( !(defined $strPassword) || ($strPassword eq "") ) { print "Password is not set!\n"; help(); };
+if ( !(defined $strOption) || ($strOption eq "") )     { print "Option is not set!\n"; help(); };
 
-# Convert to lowercase to prevented unexpected things happening while trying to match the option.
+# Convert to lowercase to prevent unexpected things happening while trying to match the option.
 $strOption = lc($strOption);
 
 # Create the NetApp API handle and test that the connection works.
 my $nahStorage = NaServer->new($strHost, 1, 15);
 $nahStorage->set_style("LOGIN");
 $nahStorage->set_admin_user($strUser, $strPassword);
-$nahStorage->set_transport_type("HTTP");
+$nahStorage->set_transport_type(($strUseSSL==1)?"HTTPS":"HTTP");
 my $nahResponse = $nahStorage->invoke("system-get-version");
 validate_ontapi_response($nahResponse, "Failed test query: ");
 
@@ -1781,6 +2026,29 @@ if ($strOption eq "volume_health") {
         }
 
         ($intState, $strOutput) = calc_disk_health($hrefDiskInfo, $strWarning, $strCritical);
+} elsif ($strOption eq "diskpath_health") {
+
+	die "ERROR: node name not set, required for this check\n" unless (defined $strVHost);
+	
+	my $hrefDiskpathInfo = get_diskpath_info($nahStorage, $strVHost);
+
+#	if (defined($strModifier)) {
+#		$hrefDiskpathInfo = filter_object($hrefDiskpathInfo, $strModifier);
+#	}
+	
+	($intState, $strOutput) = calc_diskpath_health($hrefDiskpathInfo, $strWarning, $strCritical);
+} elsif ($strOption eq "diskcount_health") {
+	
+	my $intDiskcount = get_diskcount_info($nahStorage, $strVHost);
+
+#	if (defined($strModifier)) {
+#		$hrefDiskcountInfo = filter_object($hrefDiskcountInfo, $strWarning, $strCritical);
+#	}
+	
+	($intState, $strOutput) = calc_diskcount_health($intDiskcount, $strWarning, $strCritical);
+} else {
+	print "UNKNOWN: unknown option, please verify syntax or sue -h to list all available options\n";
+	exit 3;
 }
 
 ## FUTURE STUFF----
