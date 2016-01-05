@@ -7,7 +7,7 @@
 # contributer:		Filip Sneppe & Kris Boeckx
 # Purpose: 			Checks NetApp ontapi clusters for various problems, like volume, aggregate, snapshot, 
 #					quota, snapmirror, filer hardware, port, interface, cluster and disk health, but also NetApp alarms
-# On Github:		https://github.com/willemdh/check_netapp_ontap
+# On Github:		https://github.com/kboeckx/check_netapp_ontap
 # On OutsideIT:		http://outsideit.net/check-netapp-ontap
 # Recent History:
 #   05/06/2014 => Set max records to 200 and removed space_to_bytes sub from $intUsedToBytes (no magnitude)
